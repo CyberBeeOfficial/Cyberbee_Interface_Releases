@@ -176,7 +176,9 @@ apt_update() {
         rc=0
         out="$(sudo apt-get update -q 2>&1 </dev/null)" || rc=$?
         printf '%s\n' "$out" >>"$LOG"
-        if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qiE "could not get lock|unable to lock"; then
+        # Here-string, not a pipe: with pipefail, "grep -q" closing a pipe early
+        # can turn a match into a failure.
+        if [ "$rc" -ne 0 ] && grep -qiE "could not get lock|unable to lock" <<<"$out"; then
             hint "waiting for Ubuntu's automatic updates to finish"
             sleep 10
             continue
@@ -309,8 +311,9 @@ This computer is $(uname -m)."
     if ! sudo -n true 2>/dev/null; then
         printf '\n  Your password is needed to install system software.\n'
         printf '  %s(Nothing appears on screen while you type it. Press Enter when done.)%s\n' "$C_D" "$C_0"
-        sudo -v || fail "The password was not accepted, so system software cannot be installed.
-Run the installer again and type the password you use to log in."
+        sudo -v || fail "The password was not accepted, or this account is not allowed to
+install software. Run the installer again and type the password you use
+to log in. On a work computer, ask your IT department for help."
         printf '\n'
     fi
     # Keep sudo alive for the duration of the install.
@@ -391,17 +394,19 @@ and look for error messages."
 Check your internet connection and run the installer again."
         fi
         if ! sudo docker compose version >/dev/null 2>&1; then
+            local compose_pkg=docker-compose-plugin
             # dpkg-query, not "dpkg -s": a removed docker.io with leftover config
             # files still passes "dpkg -s", and installing docker-compose-v2 then
             # would pull docker.io back in and remove the user's docker-ce.
             if dpkg-query -W -f='${Status}' docker.io 2>/dev/null | grep -q "install ok installed" \
                && r="$(resolve_pkg docker-compose-v2)"; then
                 # Ubuntu's own docker.io pairs with Ubuntu's own compose package.
-                apt_install "$r" || fail "Installing Docker Compose (docker-compose-v2) failed."
+                compose_pkg="$r"
             else
                 add_docker_repo
-                apt_install docker-compose-plugin || fail "Installing Docker Compose (docker-compose-plugin) failed."
             fi
+            apt_install "$compose_pkg" || fail "Installing Docker Compose ($compose_pkg) failed.
+Check your internet connection and run the installer again."
         fi
         sudo docker compose version >>"$LOG" 2>&1 || fail "Docker was installed, but 'docker compose' does not work.
 Restart the computer and run the installer again."
@@ -488,7 +493,7 @@ Check your internet connection and run the installer again."
     local SKIP_APP=0
     if [ -n "$OLD_VERSION" ] && [ "$OLD_VERSION" = "$NEW_VERSION" ] && [ "$FORCE" -eq 0 ]; then
         SKIP_APP=1
-        begin "Cyberbee Interface $NEW_VERSION is already installed"
+        begin "Cyberbee Interface $NEW_VERSION already installed"
         ok
     fi
 
@@ -503,12 +508,11 @@ Check your internet connection and run the installer again."
         curl -fsSL --retry 3 --retry-delay 3 -o "$ZIP" "$ASSET_URL" >>"$LOG" 2>&1 \
             || fail "The download did not finish.
 Check your internet connection and run the installer again."
-        if [ "${ASSET_DIGEST:-none}" != "none" ] && [ "${ASSET_DIGEST%%:*}" = "sha256" ]; then
-            echo "${ASSET_DIGEST#sha256:}  $ZIP" | sha256sum -c --quiet - >>"$LOG" 2>&1 \
-                || fail "The download is damaged. Run the installer again to download it again."
+        if [ "${ASSET_DIGEST%%:*}" = "sha256" ]; then
+            echo "${ASSET_DIGEST#sha256:}  $ZIP" | sha256sum -c --quiet -
         else
-            unzip -tq "$ZIP" >>"$LOG" 2>&1 || fail "The download is damaged. Run the installer again to download it again."
-        fi
+            unzip -tq "$ZIP"
+        fi >>"$LOG" 2>&1 || fail "The download is damaged. Run the installer again to download it again."
         ok
 
         begin "Installing Cyberbee Interface $NEW_VERSION"
@@ -578,11 +582,13 @@ Free some disk space and run the installer again."
 
     local DESKTOP_DIR LINK
     DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
-    if [ -d "$DESKTOP_DIR" ] && [ "$DESKTOP_DIR" != "$HOME" ] && [ "$DESKTOP_DIR" != "$INSTALL_PARENT" ]; then
+    if [ -d "$DESKTOP_DIR" ] && [ "$DESKTOP_DIR" != "$HOME" ]; then
         # The folder link replaces the launcher icon older installers put there.
         rm -f "$DESKTOP_DIR/$DESKTOP_ID.desktop"
         LINK="$DESKTOP_DIR/$APP_NAME"
-        if [ -L "$LINK" ] || [ ! -e "$LINK" ]; then
+        if [ "$DESKTOP_DIR" = "$INSTALL_PARENT" ]; then
+            :   # --dir put the app folder itself on the Desktop
+        elif [ -L "$LINK" ] || [ ! -e "$LINK" ]; then
             ln -sfn "$INSTALL_DIR" "$LINK"
         else
             printf 'Not linking: %s already exists and is not a link\n' "$LINK" >>"$LOG"
@@ -617,10 +623,10 @@ Free some disk space and run the installer again."
     elif [ "$APP_RUNNING" -eq 0 ]; then
         # Start the real program headless for a few seconds: catches anything ldd
         # cannot (a missing library loaded at import time, a broken bundle, ...).
-        local SMOKE_RC=0
-        printf -- '--- test start (offscreen) ---\n' >>"$LOG"
-        ( cd "$INSTALL_DIR" && QT_QPA_PLATFORM=offscreen timeout -s TERM 15 "$EXE" ) >>"$LOG" 2>&1 </dev/null || SMOKE_RC=$?
-        if [ "$SMOKE_RC" -eq 124 ] && ! tail -n +"$(( LOG_MARK + 1 ))" "$LOG" | grep -qE "Traceback|Failed to execute script"; then
+        local SMOKE_RC=0 SMOKE_LOG="$TMP_DIR/smoke.log"
+        ( cd "$INSTALL_DIR" && QT_QPA_PLATFORM=offscreen timeout -s TERM 15 "$EXE" ) >"$SMOKE_LOG" 2>&1 </dev/null || SMOKE_RC=$?
+        cat "$SMOKE_LOG" >>"$LOG"
+        if [ "$SMOKE_RC" -eq 124 ] && ! grep -qE "Traceback|Failed to execute script" "$SMOKE_LOG"; then
             ok
         else
             APP_OK=0
@@ -638,9 +644,6 @@ Free some disk space and run the installer again."
 
     # ── Done ─────────────────────────────────────────────────────────────────
     trap - ERR
-    local HAVE_GUI=0
-    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null 2>&1; then HAVE_GUI=1; fi
-
     if [ "${#PROBLEMS[@]}" -gt 0 ]; then
         save_log || true
         printf '\n%s  Cyberbee Interface %s is installed, but something is wrong:%s\n' "$C_E" "$NEW_VERSION" "$C_0"
@@ -650,12 +653,14 @@ Free some disk space and run the installer again."
         printf '\n%s  Done! Cyberbee Interface %s is installed.%s\n' "$C_OK" "$NEW_VERSION" "$C_0"
     fi
 
-    if [ "$HAVE_GUI" -eq 1 ]; then
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
         # The folder first, then the app, so the app window ends up in front.
-        ( cd "$INSTALL_DIR" && setsid xdg-open "$INSTALL_DIR" </dev/null >>"$LOG" 2>&1 & )
+        # "setsid -f" detaches fully: closing the Terminal does not close them,
+        # and bash never prints a message about them.
+        setsid -f xdg-open "$INSTALL_DIR" </dev/null >/dev/null 2>&1 || true
         if [ "$APP_OK" -eq 1 ] && [ "$APP_RUNNING" -eq 0 ]; then
             sleep 1
-            ( cd "$INSTALL_DIR" && setsid "$EXE" </dev/null >/dev/null 2>&1 & )
+            ( cd "$INSTALL_DIR" && setsid -f "$EXE" </dev/null >/dev/null 2>&1 ) || true
             printf '  Starting it now...\n'
         fi
     fi
